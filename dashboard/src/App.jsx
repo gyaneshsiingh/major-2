@@ -6,7 +6,7 @@ import UploadVideo from './pages/UploadVideo'
 import CompareSection from './pages/CompareSection'
 import ResultsSection from './pages/ResultsSection'
 
-const API = 'http://localhost:8000'
+const API = import.meta.env.VITE_API_URL || 'http://localhost:8000'
 
 export default function App() {
   const [page, setPage] = useState('Dashboard')
