@@ -336,6 +336,99 @@ body {
   font-family: 'Inter', sans-serif;
 }
 
+/* ── Responsive & Mobile ── */
+@media (max-width: 1024px) {
+  .two-col {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 768px) {
+  .sidebar {
+    position: fixed;
+    z-index: 1000;
+    left: -260px;
+    transition: left 0.3s ease;
+  }
+
+  .sidebar.open {
+    left: 0;
+  }
+
+  .main-area {
+    margin-left: 0;
+    width: 100%;
+  }
+
+  .stats-grid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .topbar {
+    padding: 0 15px;
+  }
+
+  .card {
+    padding: 15px;
+  }
+
+  .data-table-wrapper {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .data-table {
+    min-width: 600px;
+  }
+
+  /* Mobile menu toggle button */
+  .mobile-menu-btn {
+    display: block !important;
+    background: none;
+    border: none;
+    color: #fff;
+    font-size: 24px;
+    cursor: pointer;
+    margin-right: 15px;
+  }
+}
+
+@media (max-width: 480px) {
+  .stats-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .page-header {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+}
+
+/* Utilities */
+.mobile-menu-btn {
+  display: none;
+}
+
+.data-table-wrapper {
+  width: 100%;
+  overflow-x: auto;
+}
+
+/* Scrollbar styling for tables */
+.data-table-wrapper::-webkit-scrollbar {
+  height: 6px;
+}
+
+.data-table-wrapper::-webkit-scrollbar-track {
+  background: #f1f3f7;
+}
+
+.data-table-wrapper::-webkit-scrollbar-thumb {
+  background: #cdd4e0;
+  border-radius: 10px;
+}
+
 .btn-primary:hover {
   background: #0069d9;
 }
@@ -495,7 +588,9 @@ body {
   max-width: 180px;
 }
 
-.flex-spacer { flex: 1; }
+.flex-spacer {
+  flex: 1;
+}
 
 /* ── Result section top row ── */
 .section-top-row {
@@ -523,6 +618,32 @@ body {
   z-index: 999;
   border: none;
   transition: transform 0.2s;
+}
+
+.next-arrow:hover {
+  transform: scale(1.1);
+}
+
+/* ── Alert ── */
+.alert {
+  border-radius: 8px;
+  padding: 12px 16px;
+  font-size: 13px;
+  margin-bottom: 12px;
+}
+
+.alert-success {
+  background: #d4edda;
+  color: #155724;
+  border: 1px solid #c3e6cb;
+}
+
+.alert-info {
+  background: #d1ecf1;
+  color: #0c5460;
+  border: 1px solid #bee5eb;
+}
+}
 }
 
 .next-arrow:hover {

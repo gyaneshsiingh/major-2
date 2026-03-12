@@ -1,38 +1,35 @@
-export function UploadsTable({ uploads }) {
+export default function UploadsTable({ uploads }) {
   if (!uploads || uploads.length === 0) {
     return (
       <div className="empty-state">
         <div className="empty-icon">📂</div>
-        <div className="empty-msg">No uploads yet. Go to Upload Video to get started.</div>
+        <div className="empty-text">No uploads yet. Go to Upload Video to get started.</div>
       </div>
     )
   }
 
   return (
-    <table className="styled-table">
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th>Name</th>
-          <th>Date</th>
-          <th>Status</th>
-          <th>Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        {uploads.map((u) => (
-          <tr key={u.id}>
-            <td>{u.id}</td>
-            <td>{u.name}</td>
-            <td>{u.date}</td>
-            <td><span className="badge">Processed</span></td>
-            <td>
-              <button className="action-btn">✏️</button>
-              <button className="action-btn">⋮</button>
-            </td>
+    <div className="data-table-wrapper">
+      <table className="data-table">
+        <thead>
+          <tr>
+            <th>Sample Name</th>
+            <th>Date</th>
+            <th>Peak (nm)</th>
+            <th>Status</th>
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {uploads.slice(0, 8).map((u) => (
+            <tr key={u.id}>
+              <td style={{ fontWeight: 600 }}>{u.sampleName}</td>
+              <td>{u.date}</td>
+              <td style={{ color: '#007bff', fontWeight: 700 }}>{u.peakNm || '—'}</td>
+              <td><span className="badge">Processed</span></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
