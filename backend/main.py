@@ -14,14 +14,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor, ExtraTreesRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import r2_score
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import make_pipeline
 
 try:
     from xgboost import XGBRegressor
@@ -113,21 +111,20 @@ def get_ensemble():
     X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
     kernel = (
-        ConstantKernel(1.0, (1e-3, 1e3))
-        * RBF(np.ones(X.shape[1]), (1e-2, 1e2))
-        + WhiteKernel(0.1, (1e-5, 1e1))
+        ConstantKernel(1e5, (1e2, 1e8))
+        * RBF(np.ones(X.shape[1]), (1e-3, 1e3))
+        + WhiteKernel(1, (1e-5, 1e3))
     )
     gpr = GaussianProcessRegressor(kernel=kernel, normalize_y=True,
-                                   n_restarts_optimizer=5, random_state=42)
+                                   n_restarts_optimizer=3, random_state=42)
     base = {
-        "rf":  make_pipeline(StandardScaler(), RandomForestRegressor(n_estimators=300, max_depth=15, random_state=42)),
-        "et":  make_pipeline(StandardScaler(), ExtraTreesRegressor(n_estimators=300, max_depth=15, random_state=42)),
-        "gbr": make_pipeline(StandardScaler(), GradientBoostingRegressor(n_estimators=300, learning_rate=0.05, max_depth=5, random_state=42)),
-        "knn": make_pipeline(StandardScaler(), KNeighborsRegressor(n_neighbors=4, weights='distance')),
-        "gpr": make_pipeline(StandardScaler(), gpr),
+        "rf":  RandomForestRegressor(n_estimators=200, random_state=42),
+        "gbr": GradientBoostingRegressor(random_state=42),
+        "gpr": gpr,
+        "knn": KNeighborsRegressor(n_neighbors=5),
     }
     if XG_AVAILABLE:
-        base["xgb"] = make_pipeline(StandardScaler(), XGBRegressor(n_estimators=300, learning_rate=0.05, max_depth=5, subsample=0.8, random_state=42))
+        base["xgb"] = XGBRegressor(n_estimators=200, learning_rate=0.08, random_state=42)
 
     scores = {}
     for name, m in base.items():
@@ -142,29 +139,15 @@ def get_ensemble():
         return sum(w * m.predict(Xi) for w, m in zip(weights, base.values()))
 
     w_r2 = r2_score(y_val, w_pred(X_val))
-    
-    # Filter base models for Stacking to only those with highly competitive performance
-    best_names = [n for n, s in scores.items() if s > 0.95]
-    if len(best_names) < 2:
-        best_names = list(scores.keys())
-        
-    stack = StackingRegressor([(n, base[n]) for n in best_names],
+    stack = StackingRegressor([(n, m) for n, m in base.items()],
                                final_estimator=Ridge(), n_jobs=-1)
     stack.fit(X_tr, y_tr)
     s_r2 = r2_score(y_val, stack.predict(X_val))
 
-    best_single_name = max(scores, key=scores.get)
-    b_r2 = scores[best_single_name]
-
-    r2s = {"stacking": s_r2, "weighted": w_r2, "best_single": b_r2}
-    best_type = max(r2s, key=r2s.get)
-
-    if best_type == "stacking":
+    if s_r2 >= w_r2:
         obj = {"type": "stacking", "model": stack, "r2": float(s_r2)}
-    elif best_type == "weighted":
-        obj = {"type": "weighted", "models": base, "weights": weights, "r2": float(w_r2)}
     else:
-        obj = {"type": f"single_{best_single_name}", "model": base[best_single_name], "r2": float(b_r2)}
+        obj = {"type": "weighted", "models": base, "weights": weights, "r2": float(w_r2)}
 
     joblib.dump(obj, MODEL_PATH)
     print(f"[INFO] Saved {obj['type']} R²={obj['r2']:.4f}")
@@ -173,7 +156,7 @@ def get_ensemble():
 
 
 def ml_predict(obj, X):
-    if obj["type"] == "stacking" or obj["type"].startswith("single_"):
+    if obj["type"] == "stacking":
         return obj["model"].predict(X)
     preds = np.zeros(len(X))
     for w, m in zip(obj["weights"], obj["models"].values()):
@@ -257,81 +240,29 @@ async def analyze(
             ret, frame = cap.read()
             if not ret:
                 break
-                
-            # 1. Crop black background border
-            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray_full, 15, 255, cv2.THRESH_BINARY)
-            coords = cv2.findNonZero(thresh)
-            
-            if coords is None:
-                continue  # Skip entirely black frames
-                
-            x, y, w_bbox, h_bbox = cv2.boundingRect(coords)
-            cropped_frame = frame[y:y+h_bbox, x:x+w_bbox]
-            gray_crop = gray_full[y:y+h_bbox, x:x+w_bbox]
-            
-            # 2. Mask out UV / Violet / Blue region aggressively
-            hsv = cv2.cvtColor(cropped_frame, cv2.COLOR_BGR2HSV)
-            # OpenCV Hue: 85 (Cyan) to 165 (Deep Purple). We drop Sat/Val to 0 to catch dark blue noise!
-            lower_violet = np.array([85, 0, 0])
-            upper_violet = np.array([165, 255, 255])
-            v_mask = cv2.inRange(hsv, lower_violet, upper_violet)
-            
-            # Valid pixels are NOT blue/violet, and NOT extremely dark
-            valid_mask = cv2.bitwise_not(v_mask)
-            valid_mask[gray_crop < 20] = 0
-            
-            h_crop, w_crop = cropped_frame.shape[:2]
+            h, w, _ = frame.shape
             gs = 8
-            ph, pw = max(1, h_crop // gs), max(1, w_crop // gs)
-            
-            valid_rgbs = []
-            valid_intensities = []
-            
+            ph, pw = max(1, h // gs), max(1, w // gs)
+            rgbs, wts = [], []
             for i in range(gs):
                 for j in range(gs):
-                    y_start, y_end = i*ph, (i+1)*ph
-                    x_start, x_end = j*pw, (j+1)*pw
-                    
-                    patch = cropped_frame[y_start:y_end, x_start:x_end]
-                    p_mask = valid_mask[y_start:y_end, x_start:x_end]
-                    p_gray = gray_crop[y_start:y_end, x_start:x_end]
-                    
-                    if patch.size == 0 or cv2.countNonZero(p_mask) == 0:
+                    patch = frame[i*ph:(i+1)*ph, j*pw:(j+1)*pw]
+                    if patch.size == 0:
                         continue
-                        
-                    # Calculate mean color strictly over the non-UV, non-black pixels
-                    mean_color = cv2.mean(patch, mask=p_mask)[:3]
-                    # BGR to RGB
-                    rgb = [mean_color[2], mean_color[1], mean_color[0]]
-                    
-                    # Ignore overly dark or washed out artifacts
-                    if sum(rgb) < 15 or sum(rgb) > 750:
+                    gray_val = float(np.mean(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)))
+                    if gray_val > 240 or gray_val < 10:
                         continue
-                        
-                    # Absolute Fallback: Mathematically guarantee no Blue/UV or grey noise slip-through.
-                    # Grey (80,80,80) and Cyan-Grey (40,80,80) incorrectly map to ~431nm in the ML model.
-                    # By ensuring Blue is strictly LESS than the dominant Red or Green signal,
-                    # we perfectly isolate bright, bloomy ROIs while destroying true greys/cyans.
-                    if rgb[2] >= max(rgb[0], rgb[1]):
-                        continue
-                        
-                    valid_rgbs.append(rgb)
-                    
-                    # Store distinct intensity for this specific patch
-                    mean_gray = cv2.mean(p_gray, mask=p_mask)[0]
-                    valid_intensities.append(mean_gray)
-                    
-            if not valid_rgbs:
+                    rgb = cv2.resize(patch, (1, 1))[0, 0][::-1].astype(float)
+                    rgbs.append(rgb)
+                    wts.append(gray_val)
+            if not rgbs:
                 continue
-                
-            # 3. Batch predict all individual grid patches
-            batch_df = pd.DataFrame(valid_rgbs, columns=["Red", "Green", "Blue"])
-            predictions = ml_predict(obj, batch_df)
-            # 4. Do NOT average the frame internally! By loading all patches dynamically,
-            # this explicitly allows bimodal logic and multiple spatial peaks in the spectrum.
+            
+            # Predict each patch separately to prevent color mixing (which causes cyan ~491nm)
+            batch_arr = np.array(rgbs, float)
+            predictions = ml_predict(obj, batch_arr)
             wavelengths.extend(predictions.tolist())
-            intensities.extend(valid_intensities)
+            intensities.extend(wts)
 
         cap.release()
     finally:
