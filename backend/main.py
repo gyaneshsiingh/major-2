@@ -268,21 +268,27 @@ async def analyze(
                     if patch.size == 0:
                         continue
                         
-                    # Find the absolute brightest pixel in this patch
-                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(p_gray)
+                    # Find the pixel with the highest true color saturation (avoids overexposed white/cyan camera flares which cause 494nm)
+                    patch_hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+                    _, max_sat, _, max_loc = cv2.minMaxLoc(patch_hsv[:, :, 1])
                     
-                    if max_val < 15:
+                    if max_sat < 30: # Ignore completely washed out grey/white pixels
                         continue
                         
-                    # Grab the pure, unmixed raw color of the brightest pixel
-                    brightest_bgr = patch[max_loc[1], max_loc[0]]
-                    rgb = np.array(brightest_bgr[::-1], dtype=float) # BGR to RGB
+                    # Grab that raw highly-saturated pure colored pixel
+                    purest_bgr = patch[max_loc[1], max_loc[0]]
+                    gray_intensity = float(p_gray[max_loc[1], max_loc[0]])
+                    
+                    if gray_intensity < 15: # Ignore deep black noise
+                        continue
+                        
+                    rgb = np.array(purest_bgr[::-1], dtype=float) # BGR to RGB
                     
                     if sum(rgb) < 20: 
                         continue
                         
                     rgbs.append(rgb)
-                    wts.append(float(max_val))
+                    wts.append(gray_intensity)
                     
             if not rgbs:
                 continue
