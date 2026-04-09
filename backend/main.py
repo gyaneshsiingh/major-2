@@ -268,20 +268,21 @@ async def analyze(
                     if patch.size == 0:
                         continue
                         
-                    # Filter black/gray noise and pure UV extremes
-                    mean_gray = float(np.mean(p_gray))
-                    if mean_gray > 245 or mean_gray < 15:
+                    # Find the absolute brightest pixel in this patch
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(p_gray)
+                    
+                    if max_val < 15:
                         continue
                         
-                    # Calculate accurate RGB without distorting blue/violet
-                    rgb = cv2.resize(patch, (1, 1))[0, 0][::-1].astype(float)
+                    # Grab the pure, unmixed raw color of the brightest pixel
+                    brightest_bgr = patch[max_loc[1], max_loc[0]]
+                    rgb = np.array(brightest_bgr[::-1], dtype=float) # BGR to RGB
                     
-                    # Safe filter for true dark/gray invisible UV noise, but ALLOW strong bright blue
                     if sum(rgb) < 20: 
                         continue
                         
                     rgbs.append(rgb)
-                    wts.append(mean_gray)
+                    wts.append(float(max_val))
                     
             if not rgbs:
                 continue
