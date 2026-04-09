@@ -279,56 +279,83 @@ async def analyze(
         if not cap.isOpened():
             raise HTTPException(400, "Cannot open video file")
 
-        frame_idx = 0
-        frame_batch_rgb = []
-        frame_batch_intensity = []
         wavelengths, intensities = [], []
         
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            frame_idx += 1
             
-            # Use the FULL frame for 8x8 grid (NOT ROI-cropped)
-            # intensity² weighting naturally suppresses black background patches
-            h, w, _ = frame.shape
+            # Step 1: Crop black background region
+            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray_full, 15, 255, cv2.THRESH_BINARY)
+            coords = cv2.findNonZero(thresh)
+            if coords is None:
+                continue
+            bx, by, bw, bh = cv2.boundingRect(coords)
+            cropped = frame[by:by+bh, bx:bx+bw]
+            
+            # Step 2: Remove UV region (mask out deep violet/blue noise)
+            hsv = cv2.cvtColor(cropped, cv2.COLOR_BGR2HSV)
+            # Mask extremely low-saturation dark noise (grey/black artifacts)
+            gray_crop = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
+            # Keep pixels that are bright enough to be real emission
+            valid_mask = (gray_crop >= 15).astype(np.uint8) * 255
+            
+            # Step 3: Auto-select ROI (find brightest 50x50 region)
+            blurred = cv2.GaussianBlur(gray_crop, (9, 9), 0)
+            _, _, _, maxLoc = cv2.minMaxLoc(blurred, mask=valid_mask if cv2.countNonZero(valid_mask) > 0 else None)
+            roi_size = 50
+            xc, yc = maxLoc
+            rx1 = max(0, xc - roi_size // 2)
+            ry1 = max(0, yc - roi_size // 2)
+            rx2 = min(cropped.shape[1], xc + roi_size // 2)
+            ry2 = min(cropped.shape[0], yc + roi_size // 2)
+            roi = cropped[ry1:ry2, rx1:rx2]
+            
+            if roi.size == 0:
+                continue
+            
+            # Step 4: Divide ROI into 8x8 grid
+            rh, rw, _ = roi.shape
             grid_size = 8
-            patch_h, patch_w = h // grid_size, w // grid_size
-
-            patch_rgbs = []
-            patch_weights = []
+            ph, pw = max(1, rh // grid_size), max(1, rw // grid_size)
+            
+            cell_predictions = []
+            cell_weights = []
             for i in range(grid_size):
                 for j in range(grid_size):
-                    y1, y2 = i * patch_h, (i + 1) * patch_h
-                    x1, x2 = j * patch_w, (j + 1) * patch_w
-                    patch = frame[y1:y2, x1:x2]
-                    if patch.size == 0:
+                    y1, y2 = i * ph, (i + 1) * ph
+                    x1, x2 = j * pw, (j + 1) * pw
+                    cell = roi[y1:y2, x1:x2]
+                    if cell.size == 0:
                         continue
-                    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-                    intensity = np.mean(gray)
-                    rgb_mean = cv2.resize(patch, (1, 1))[0, 0][::-1]
-                    patch_rgbs.append(rgb_mean)
-                    patch_weights.append(intensity ** 2)
-
-            patch_weights = np.array(patch_weights)
-            if patch_weights.sum() == 0:
+                    
+                    cell_gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
+                    cell_intensity = float(np.mean(cell_gray))
+                    
+                    # Skip dark/empty cells
+                    if cell_intensity < 10:
+                        continue
+                    
+                    # Step 5: Predict each grid cell independently
+                    rgb_mean = cv2.resize(cell, (1, 1))[0, 0][::-1].astype(float)
+                    pred_nm = float(ml_predict(obj, rgb_mean.reshape(1, -1))[0])
+                    
+                    cell_predictions.append(pred_nm)
+                    cell_weights.append(cell_intensity ** 2)
+            
+            if not cell_predictions:
                 continue
-            patch_weights /= patch_weights.sum()
-            patch_rgbs = np.array(patch_rgbs)
-            weighted_rgb = np.average(patch_rgbs, axis=0, weights=patch_weights)
-
-            frame_batch_rgb.append(weighted_rgb)
-            frame_batch_intensity.append(np.mean(patch_weights))
-
-            # Aggregate every 26 frames (~1 sec)
-            if frame_idx % 26 == 0:
-                avg_rgb = np.mean(frame_batch_rgb, axis=0)
-                avg_intensity = np.mean(frame_batch_intensity)
-                pred_nm = float(ml_predict(obj, np.array(avg_rgb).reshape(1, -1))[0])
-                wavelengths.append(pred_nm)
-                intensities.append(avg_intensity)
-                frame_batch_rgb, frame_batch_intensity = [], []
+            
+            # Step 6: Weighted average of the PREDICTIONS (not the colors)
+            cell_weights = np.array(cell_weights)
+            cell_weights /= cell_weights.sum()
+            frame_nm = float(np.average(cell_predictions, weights=cell_weights))
+            frame_intensity = float(np.mean(cell_weights))
+            
+            wavelengths.append(frame_nm)
+            intensities.append(frame_intensity)
 
         cap.release()
     finally:
