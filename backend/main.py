@@ -179,7 +179,7 @@ def get_ensemble():
         scores[name] = s
         print(f"  {name} R²={s:.4f}")
 
-    # ── Strategy 1: R²-weighted ensemble ──
+    # ── True Ensemble: use ALL models, weighted by R² ──
     r2_arr = np.array([max(0, s) for s in scores.values()])
     weights = r2_arr / (r2_arr.sum() or 1)
 
@@ -187,45 +187,24 @@ def get_ensemble():
         return sum(w * m.predict(Xi) for w, m in zip(weights, base.values()))
 
     w_r2 = r2_score(y_val, w_pred(X_val))
-    print(f"  weighted R²={w_r2:.4f}")
+    print(f"  ensemble (all models weighted) R²={w_r2:.4f}")
+    
+    # Print each model's contribution weight
+    for name, w in zip(base.keys(), weights):
+        print(f"    {name}: weight={w:.4f}, R²={scores[name]:.4f}")
 
-    # ── Strategy 2: Stacking (only top performers) ──
-    top_names = [n for n, s in scores.items() if s > 0.95]
-    if len(top_names) < 3:
-        top_names = sorted(scores, key=scores.get, reverse=True)[:4]
-    stack = StackingRegressor([(n, base[n]) for n in top_names],
-                               final_estimator=Ridge(alpha=1.0), cv=5, n_jobs=-1)
-    stack.fit(X_tr, y_tr)
-    s_r2 = r2_score(y_val, stack.predict(X_val))
-    print(f"  stacking R²={s_r2:.4f}")
-
-    # ── Strategy 3: Best single model ──
-    best_single_name = max(scores, key=scores.get)
-    b_r2 = scores[best_single_name]
-    print(f"  best_single ({best_single_name}) R²={b_r2:.4f}")
-
-    # Pick the best strategy
-    r2s = {"stacking": s_r2, "weighted": w_r2, "best_single": b_r2}
-    best_type = max(r2s, key=r2s.get)
-
-    if best_type == "stacking":
-        obj = {"type": "stacking", "model": stack, "r2": float(s_r2)}
-    elif best_type == "weighted":
-        obj = {"type": "weighted", "models": base, "weights": weights, "r2": float(w_r2)}
-    else:
-        obj = {"type": f"single_{best_single_name}", "model": base[best_single_name], "r2": float(b_r2)}
+    obj = {"type": "ensemble_all", "models": base, "weights": weights, "r2": float(w_r2),
+           "model_scores": {n: float(s) for n, s in scores.items()}}
 
     joblib.dump(obj, MODEL_PATH)
-    print(f"[INFO] ✅ Saved {obj['type']} R²={obj['r2']:.4f}")
+    print(f"[INFO] ✅ Saved ensemble_all R²={obj['r2']:.4f} using {len(base)} models")
     _ensemble_cache = obj
     return obj
 
 
 def ml_predict(obj, X_raw):
-    """Apply feature engineering, then predict."""
+    """Apply feature engineering, then predict using ALL models weighted by R²."""
     X = engineer_features(X_raw)
-    if obj["type"] == "stacking" or obj["type"].startswith("single_"):
-        return obj["model"].predict(X)
     preds = np.zeros(len(X))
     for w, m in zip(obj["weights"], obj["models"].values()):
         preds += w * m.predict(X)
