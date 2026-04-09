@@ -240,27 +240,56 @@ async def analyze(
             ret, frame = cap.read()
             if not ret:
                 break
-            h, w, _ = frame.shape
+            # 1. Background Cropping (Black region removal)
+            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray_full, 15, 255, cv2.THRESH_BINARY)
+            coords = cv2.findNonZero(thresh)
+            
+            if coords is None:
+                continue
+                
+            x, y, w_bbox, h_bbox = cv2.boundingRect(coords)
+            cropped_frame = frame[y:y+h_bbox, x:x+w_bbox]
+            gray_crop = gray_full[y:y+h_bbox, x:x+w_bbox]
+            
+            h_crop, w_crop = cropped_frame.shape[:2]
             gs = 8
-            ph, pw = max(1, h // gs), max(1, w // gs)
+            ph, pw = max(1, h_crop // gs), max(1, w_crop // gs)
+            
             rgbs, wts = [], []
             for i in range(gs):
                 for j in range(gs):
-                    patch = frame[i*ph:(i+1)*ph, j*pw:(j+1)*pw]
+                    y_start, y_end = i*ph, (i+1)*ph
+                    x_start, x_end = j*pw, (j+1)*pw
+                    
+                    patch = cropped_frame[y_start:y_end, x_start:x_end]
+                    p_gray = gray_crop[y_start:y_end, x_start:x_end]
+                    
                     if patch.size == 0:
                         continue
-                    gray_val = float(np.mean(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)))
-                    if gray_val > 240 or gray_val < 10:
+                        
+                    # Filter black/gray noise and pure UV extremes
+                    mean_gray = float(np.mean(p_gray))
+                    if mean_gray > 245 or mean_gray < 15:
                         continue
+                        
+                    # Calculate accurate RGB without distorting blue/violet
                     rgb = cv2.resize(patch, (1, 1))[0, 0][::-1].astype(float)
+                    
+                    # Safe filter for true dark/gray invisible UV noise, but ALLOW strong bright blue
+                    if sum(rgb) < 20: 
+                        continue
+                        
                     rgbs.append(rgb)
-                    wts.append(gray_val)
+                    wts.append(mean_gray)
+                    
             if not rgbs:
                 continue
-            
-            # Predict each patch separately to prevent color mixing (which causes cyan ~491nm)
+                
+            # Batched Grid Prediction (Evaluate patches independently to avoid color averaging)
             batch_arr = np.array(rgbs, float)
             predictions = ml_predict(obj, batch_arr)
+            # Collect and keep all grid predictions to build the multimodal spectrum
             wavelengths.extend(predictions.tolist())
             intensities.extend(wts)
 
