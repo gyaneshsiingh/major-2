@@ -15,13 +15,17 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 
-from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.ensemble import (RandomForestRegressor, GradientBoostingRegressor,
+                               StackingRegressor, ExtraTreesRegressor)
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.linear_model import Ridge
+from sklearn.svm import SVR
 from sklearn.metrics import r2_score
+from sklearn.preprocessing import StandardScaler, PolynomialFeatures
+from sklearn.pipeline import make_pipeline
 
 try:
     from xgboost import XGBRegressor
@@ -82,6 +86,26 @@ def init_db():
 
 init_db()
 
+# ── Feature Engineering ──────────────────────────────────────
+def engineer_features(X_raw):
+    """Add derived features: channel ratios, differences, and dominant channel.
+    This helps the model distinguish similar colors more precisely."""
+    df = pd.DataFrame(X_raw, columns=["Red", "Green", "Blue"]) if not isinstance(X_raw, pd.DataFrame) else X_raw.copy()
+    R, G, B = df["Red"].values, df["Green"].values, df["Blue"].values
+    total = R + G + B + 1e-6  # avoid division by zero
+    
+    df["R_ratio"] = R / total
+    df["G_ratio"] = G / total
+    df["B_ratio"] = B / total
+    df["RG_diff"] = R - G
+    df["GB_diff"] = G - B
+    df["RB_diff"] = R - B
+    df["max_ch"]  = np.maximum(R, np.maximum(G, B))
+    df["min_ch"]  = np.minimum(R, np.minimum(G, B))
+    df["range"]   = df["max_ch"] - df["min_ch"]
+    return df
+
+
 # ── Ensemble ─────────────────────────────────────────────────
 _ensemble_cache = None
 
@@ -108,32 +132,54 @@ def get_ensemble():
 
     print(f"[INFO] Training on {csv_path}")
     df = pd.read_csv(csv_path)
-    X = df.drop(columns=["nm"])
+    X_raw = df.drop(columns=["nm"])
     y = df["nm"].values
+    
+    # Feature engineering for richer model input
+    X = engineer_features(X_raw)
+    print(f"[INFO] Features: {list(X.columns)} ({X.shape[1]} total)")
+    
     X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
+    # Build strong base models with StandardScaler pipelines
     kernel = (
         ConstantKernel(1e5, (1e2, 1e8))
         * RBF(np.ones(X.shape[1]), (1e-3, 1e3))
         + WhiteKernel(1, (1e-5, 1e3))
     )
-    gpr = GaussianProcessRegressor(kernel=kernel, normalize_y=True,
-                                   n_restarts_optimizer=5, random_state=42)
     base = {
-        "rf":  RandomForestRegressor(n_estimators=200, random_state=42),
-        "gbr": GradientBoostingRegressor(random_state=42),
-        "gpr": gpr,
-        "knn": KNeighborsRegressor(n_neighbors=5),
+        "rf":  make_pipeline(StandardScaler(),
+                   RandomForestRegressor(n_estimators=500, max_depth=20,
+                                        min_samples_leaf=2, random_state=42)),
+        "et":  make_pipeline(StandardScaler(),
+                   ExtraTreesRegressor(n_estimators=500, max_depth=20,
+                                      min_samples_leaf=2, random_state=42)),
+        "gbr": make_pipeline(StandardScaler(),
+                   GradientBoostingRegressor(n_estimators=500, learning_rate=0.05,
+                                            max_depth=5, subsample=0.8, random_state=42)),
+        "knn": make_pipeline(StandardScaler(),
+                   KNeighborsRegressor(n_neighbors=3, weights='distance')),
+        "svr": make_pipeline(StandardScaler(),
+                   SVR(kernel='rbf', C=100, gamma='scale')),
+        "gpr": make_pipeline(StandardScaler(),
+                   GaussianProcessRegressor(kernel=kernel, normalize_y=True,
+                                            n_restarts_optimizer=5, random_state=42)),
     }
     if XG_AVAILABLE:
-        base["xgb"] = XGBRegressor(n_estimators=200, learning_rate=0.08, random_state=42)
+        base["xgb"] = make_pipeline(StandardScaler(),
+                         XGBRegressor(n_estimators=500, learning_rate=0.05,
+                                     max_depth=5, subsample=0.8,
+                                     colsample_bytree=0.8, random_state=42))
 
+    # Train and evaluate each base model
     scores = {}
     for name, m in base.items():
         m.fit(X_tr, y_tr)
-        scores[name] = r2_score(y_val, m.predict(X_val))
-        print(f"  {name} R²={scores[name]:.4f}")
+        s = r2_score(y_val, m.predict(X_val))
+        scores[name] = s
+        print(f"  {name} R²={s:.4f}")
 
+    # ── Strategy 1: R²-weighted ensemble ──
     r2_arr = np.array([max(0, s) for s in scores.values()])
     weights = r2_arr / (r2_arr.sum() or 1)
 
@@ -141,24 +187,44 @@ def get_ensemble():
         return sum(w * m.predict(Xi) for w, m in zip(weights, base.values()))
 
     w_r2 = r2_score(y_val, w_pred(X_val))
-    stack = StackingRegressor([(n, m) for n, m in base.items()],
-                               final_estimator=Ridge(), n_jobs=-1)
+    print(f"  weighted R²={w_r2:.4f}")
+
+    # ── Strategy 2: Stacking (only top performers) ──
+    top_names = [n for n, s in scores.items() if s > 0.95]
+    if len(top_names) < 3:
+        top_names = sorted(scores, key=scores.get, reverse=True)[:4]
+    stack = StackingRegressor([(n, base[n]) for n in top_names],
+                               final_estimator=Ridge(alpha=1.0), cv=5, n_jobs=-1)
     stack.fit(X_tr, y_tr)
     s_r2 = r2_score(y_val, stack.predict(X_val))
+    print(f"  stacking R²={s_r2:.4f}")
 
-    if s_r2 >= w_r2:
+    # ── Strategy 3: Best single model ──
+    best_single_name = max(scores, key=scores.get)
+    b_r2 = scores[best_single_name]
+    print(f"  best_single ({best_single_name}) R²={b_r2:.4f}")
+
+    # Pick the best strategy
+    r2s = {"stacking": s_r2, "weighted": w_r2, "best_single": b_r2}
+    best_type = max(r2s, key=r2s.get)
+
+    if best_type == "stacking":
         obj = {"type": "stacking", "model": stack, "r2": float(s_r2)}
-    else:
+    elif best_type == "weighted":
         obj = {"type": "weighted", "models": base, "weights": weights, "r2": float(w_r2)}
+    else:
+        obj = {"type": f"single_{best_single_name}", "model": base[best_single_name], "r2": float(b_r2)}
 
     joblib.dump(obj, MODEL_PATH)
-    print(f"[INFO] Saved {obj['type']} R²={obj['r2']:.4f}")
+    print(f"[INFO] ✅ Saved {obj['type']} R²={obj['r2']:.4f}")
     _ensemble_cache = obj
     return obj
 
 
-def ml_predict(obj, X):
-    if obj["type"] == "stacking":
+def ml_predict(obj, X_raw):
+    """Apply feature engineering, then predict."""
+    X = engineer_features(X_raw)
+    if obj["type"] == "stacking" or obj["type"].startswith("single_"):
         return obj["model"].predict(X)
     preds = np.zeros(len(X))
     for w, m in zip(obj["weights"], obj["models"].values()):
