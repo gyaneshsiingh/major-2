@@ -453,8 +453,8 @@ async def analyze(
         "max_nm":        stats["max_nm"],
         "ensemble_type": obj["type"],
         "ensemble_r2":   round(obj["r2"], 4),
-        "spectrum_x":    json.dumps(x_grid.tolist()),
-        "spectrum_y":    json.dumps(spec.tolist()),
+        "spectrum_x":    json.dumps(x_grid),
+        "spectrum_y":    json.dumps(spec),
     }
     pd.DataFrame([record]).to_sql("results", engine, if_exists="append", index=False)
 
@@ -462,7 +462,7 @@ async def analyze(
     return {
         "stats": stats,
         "model": {"type": obj["type"], "r2": round(obj["r2"], 4)},
-        "spectrum": {"x": x_grid.tolist(), "y": spec.tolist()},
+        "spectrum": {"x": x_grid, "y": spec},
         "frames": {
             "wavelength": wl[::stride].tolist(),
             "intensity":  (inten / inten.max() if inten.max() > 0 else inten)[::stride].tolist(),
