@@ -290,8 +290,6 @@ async def analyze(
                 break
             frame_idx += 1
             
-            # Use the FULL frame for 8x8 grid (NOT ROI-cropped)
-            # intensity² weighting naturally suppresses black background patches
             h, w, _ = frame.shape
             grid_size = 8
             patch_h, patch_w = h // grid_size, w // grid_size
@@ -306,20 +304,34 @@ async def analyze(
                     if patch.size == 0:
                         continue
                     gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
-                    intensity = np.mean(gray)
+                    brightness = float(np.mean(gray))
+                    
+                    # Hard filter: completely discard dark background patches
+                    if brightness < 10:
+                        continue
+                    
+                    # Saturation score: vibrant colored patches are more reliable
+                    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+                    saturation = float(np.mean(hsv[:, :, 1]))
+                    
+                    # Combined weight: brightness³ × (1 + saturation/255)
+                    # brightness³ aggressively focuses on bright patches
+                    # saturation bonus rewards vibrant colors over washed-out greys
+                    weight = (brightness ** 3) * (1.0 + saturation / 255.0)
+                    
                     rgb_mean = cv2.resize(patch, (1, 1))[0, 0][::-1]
                     patch_rgbs.append(rgb_mean)
-                    patch_weights.append(intensity ** 2)
+                    patch_weights.append(weight)
 
-            patch_weights = np.array(patch_weights)
-            if patch_weights.sum() == 0:
+            if not patch_rgbs or sum(patch_weights) == 0:
                 continue
+            patch_weights = np.array(patch_weights)
             patch_weights /= patch_weights.sum()
             patch_rgbs = np.array(patch_rgbs)
             weighted_rgb = np.average(patch_rgbs, axis=0, weights=patch_weights)
 
             frame_batch_rgb.append(weighted_rgb)
-            frame_batch_intensity.append(np.mean(patch_weights))
+            frame_batch_intensity.append(float(np.max(patch_weights)))
 
             # Aggregate every 26 frames (~1 sec)
             if frame_idx % 26 == 0:
