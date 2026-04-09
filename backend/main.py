@@ -8,24 +8,18 @@ import pandas as pd
 import cv2
 import joblib
 from datetime import datetime
-import scipy.ndimage as ndi
-import scipy.signal as signal
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.ensemble import (RandomForestRegressor, GradientBoostingRegressor,
-                               StackingRegressor, ExtraTreesRegressor)
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.linear_model import Ridge
-from sklearn.svm import SVR
 from sklearn.metrics import r2_score
-from sklearn.preprocessing import StandardScaler, PolynomialFeatures
-from sklearn.pipeline import make_pipeline
 
 try:
     from xgboost import XGBRegressor
@@ -86,26 +80,6 @@ def init_db():
 
 init_db()
 
-# ── Feature Engineering ──────────────────────────────────────
-def engineer_features(X_raw):
-    """Add derived features: channel ratios, differences, and dominant channel.
-    This helps the model distinguish similar colors more precisely."""
-    df = pd.DataFrame(X_raw, columns=["Red", "Green", "Blue"]) if not isinstance(X_raw, pd.DataFrame) else X_raw.copy()
-    R, G, B = df["Red"].values, df["Green"].values, df["Blue"].values
-    total = R + G + B + 1e-6  # avoid division by zero
-    
-    df["R_ratio"] = R / total
-    df["G_ratio"] = G / total
-    df["B_ratio"] = B / total
-    df["RG_diff"] = R - G
-    df["GB_diff"] = G - B
-    df["RB_diff"] = R - B
-    df["max_ch"]  = np.maximum(R, np.maximum(G, B))
-    df["min_ch"]  = np.minimum(R, np.minimum(G, B))
-    df["range"]   = df["max_ch"] - df["min_ch"]
-    return df
-
-
 # ── Ensemble ─────────────────────────────────────────────────
 _ensemble_cache = None
 
@@ -132,54 +106,32 @@ def get_ensemble():
 
     print(f"[INFO] Training on {csv_path}")
     df = pd.read_csv(csv_path)
-    X_raw = df.drop(columns=["nm"])
+    X = df.drop(columns=["nm"])
     y = df["nm"].values
-    
-    # Feature engineering for richer model input
-    X = engineer_features(X_raw)
-    print(f"[INFO] Features: {list(X.columns)} ({X.shape[1]} total)")
-    
     X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
 
-    # Build strong base models with StandardScaler pipelines
     kernel = (
         ConstantKernel(1e5, (1e2, 1e8))
         * RBF(np.ones(X.shape[1]), (1e-3, 1e3))
         + WhiteKernel(1, (1e-5, 1e3))
     )
+    gpr = GaussianProcessRegressor(kernel=kernel, normalize_y=True,
+                                   n_restarts_optimizer=3, random_state=42)
     base = {
-        "rf":  make_pipeline(StandardScaler(),
-                   RandomForestRegressor(n_estimators=500, max_depth=20,
-                                        min_samples_leaf=2, random_state=42)),
-        "et":  make_pipeline(StandardScaler(),
-                   ExtraTreesRegressor(n_estimators=500, max_depth=20,
-                                      min_samples_leaf=2, random_state=42)),
-        "gbr": make_pipeline(StandardScaler(),
-                   GradientBoostingRegressor(n_estimators=500, learning_rate=0.05,
-                                            max_depth=5, subsample=0.8, random_state=42)),
-        "knn": make_pipeline(StandardScaler(),
-                   KNeighborsRegressor(n_neighbors=3, weights='distance')),
-        "svr": make_pipeline(StandardScaler(),
-                   SVR(kernel='rbf', C=100, gamma='scale')),
-        "gpr": make_pipeline(StandardScaler(),
-                   GaussianProcessRegressor(kernel=kernel, normalize_y=True,
-                                            n_restarts_optimizer=5, random_state=42)),
+        "rf":  RandomForestRegressor(n_estimators=200, random_state=42),
+        "gbr": GradientBoostingRegressor(random_state=42),
+        "gpr": gpr,
+        "knn": KNeighborsRegressor(n_neighbors=5),
     }
     if XG_AVAILABLE:
-        base["xgb"] = make_pipeline(StandardScaler(),
-                         XGBRegressor(n_estimators=500, learning_rate=0.05,
-                                     max_depth=5, subsample=0.8,
-                                     colsample_bytree=0.8, random_state=42))
+        base["xgb"] = XGBRegressor(n_estimators=200, learning_rate=0.08, random_state=42)
 
-    # Train and evaluate each base model
     scores = {}
     for name, m in base.items():
         m.fit(X_tr, y_tr)
-        s = r2_score(y_val, m.predict(X_val))
-        scores[name] = s
-        print(f"  {name} R²={s:.4f}")
+        scores[name] = r2_score(y_val, m.predict(X_val))
+        print(f"  {name} R²={scores[name]:.4f}")
 
-    # ── True Ensemble: use ALL models, weighted by R² ──
     r2_arr = np.array([max(0, s) for s in scores.values()])
     weights = r2_arr / (r2_arr.sum() or 1)
 
@@ -187,24 +139,25 @@ def get_ensemble():
         return sum(w * m.predict(Xi) for w, m in zip(weights, base.values()))
 
     w_r2 = r2_score(y_val, w_pred(X_val))
-    print(f"  ensemble (all models weighted) R²={w_r2:.4f}")
-    
-    # Print each model's contribution weight
-    for name, w in zip(base.keys(), weights):
-        print(f"    {name}: weight={w:.4f}, R²={scores[name]:.4f}")
+    stack = StackingRegressor([(n, m) for n, m in base.items()],
+                               final_estimator=Ridge(), n_jobs=-1)
+    stack.fit(X_tr, y_tr)
+    s_r2 = r2_score(y_val, stack.predict(X_val))
 
-    obj = {"type": "ensemble_all", "models": base, "weights": weights, "r2": float(w_r2),
-           "model_scores": {n: float(s) for n, s in scores.items()}}
+    if s_r2 >= w_r2:
+        obj = {"type": "stacking", "model": stack, "r2": float(s_r2)}
+    else:
+        obj = {"type": "weighted", "models": base, "weights": weights, "r2": float(w_r2)}
 
     joblib.dump(obj, MODEL_PATH)
-    print(f"[INFO] ✅ Saved ensemble_all R²={obj['r2']:.4f} using {len(base)} models")
+    print(f"[INFO] Saved {obj['type']} R²={obj['r2']:.4f}")
     _ensemble_cache = obj
     return obj
 
 
-def ml_predict(obj, X_raw):
-    """Apply feature engineering, then predict using ALL models weighted by R²."""
-    X = engineer_features(X_raw)
+def ml_predict(obj, X):
+    if obj["type"] == "stacking":
+        return obj["model"].predict(X)
     preds = np.zeros(len(X))
     for w, m in zip(obj["weights"], obj["models"].values()):
         preds += w * m.predict(X)
@@ -212,59 +165,17 @@ def ml_predict(obj, X_raw):
 
 
 def build_spectrum(wl, inten, x_min=300, x_max=700, step=1.0, sigma=20.0):
-    wl = np.asarray(wl, dtype=float)
-    inten = np.asarray(inten, dtype=float)
+    wl = np.asarray(wl, float)
+    inten = np.asarray(inten, float)
     x_grid = np.arange(x_min, x_max + step, step)
-    
     if len(wl) == 0:
-        return x_grid.tolist(), np.zeros_like(x_grid).tolist(), float("nan")
-
-    if np.allclose(wl, wl[0]):
-        peak_wl = float(wl[0])
-        x_s = np.linspace(max(300, peak_wl - 5), min(700, peak_wl + 5), 200)
-        y_s = np.exp(-0.5 * ((x_s - peak_wl) / 1.5) ** 2)
-        y_s = y_s / np.max(y_s)
-        return x_s.tolist(), y_s.tolist(), peak_wl
-
-    wl_min, wl_max = wl.min(), wl.max()
-    wl_range = max(1e-6, wl_max - wl_min)
-    bins = int(np.clip(wl_range * 2.0, 80, 400))
-
-    hist, bin_edges = np.histogram(wl, bins=bins, range=(wl_min - 0.1*wl_range, wl_max + 0.1*wl_range), weights=inten)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-
-    if hist.max() > 0:
-        hist = hist.astype(float) / np.max(hist)
-    else:
-        hist = hist.astype(float)
-
-    gaussian_sigma = max(1.0, bins / 150.0)
-    y_s = ndi.gaussian_filter1d(hist, sigma=gaussian_sigma)
-    x_s = bin_centers
-
-    y_s = np.clip(y_s, 0.0, None)
-    if y_s.max() > 0:
-        y_s = y_s / y_s.max()
-
-    peaks, props = signal.find_peaks(y_s, height=0.2, distance=3)
-    if len(peaks) > 0:
-        peak_idx = peaks[np.argmax(props["peak_heights"])]
-        peak_wl = float(x_s[peak_idx])
-    else:
-        peak_idx = int(np.argmax(y_s))
-        peak_wl = float(x_s[peak_idx])
-
-    return x_s.tolist(), y_s.tolist(), peak_wl
-
-def detect_dynamic_roi(frame, roi_size=50):
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (9, 9), 0)
-    _, _, _, maxLoc = cv2.minMaxLoc(gray)
-    xc, yc = maxLoc
-    x1, y1 = max(0, xc - roi_size//2), max(0, yc - roi_size//2)
-    x2, y2 = min(frame.shape[1], xc + roi_size//2), min(frame.shape[0], yc + roi_size//2)
-    roi = frame[y1:y2, x1:x2]
-    return roi
+        return x_grid, np.zeros_like(x_grid), float("nan")
+    w = inten / inten.max() if inten.max() > 0 else inten
+    gauss = np.exp(-0.5 * ((x_grid[None, :] - wl[:, None]) / sigma) ** 2)
+    spec = (w[:, None] * gauss).sum(axis=0)
+    if spec.max() > 0:
+        spec /= spec.max()
+    return x_grid, spec, float(x_grid[np.argmax(spec)])
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -325,82 +236,33 @@ async def analyze(
             raise HTTPException(400, "Cannot open video file")
 
         wavelengths, intensities = [], []
-        
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            
-            # Step 1: Crop black background region
-            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray_full, 15, 255, cv2.THRESH_BINARY)
-            coords = cv2.findNonZero(thresh)
-            if coords is None:
-                continue
-            bx, by, bw, bh = cv2.boundingRect(coords)
-            cropped = frame[by:by+bh, bx:bx+bw]
-            
-            # Step 2: Remove UV region (mask out deep violet/blue noise)
-            hsv = cv2.cvtColor(cropped, cv2.COLOR_BGR2HSV)
-            # Mask extremely low-saturation dark noise (grey/black artifacts)
-            gray_crop = cv2.cvtColor(cropped, cv2.COLOR_BGR2GRAY)
-            # Keep pixels that are bright enough to be real emission
-            valid_mask = (gray_crop >= 15).astype(np.uint8) * 255
-            
-            # Step 3: Auto-select ROI (find brightest 50x50 region)
-            blurred = cv2.GaussianBlur(gray_crop, (9, 9), 0)
-            _, _, _, maxLoc = cv2.minMaxLoc(blurred, mask=valid_mask if cv2.countNonZero(valid_mask) > 0 else None)
-            roi_size = 50
-            xc, yc = maxLoc
-            rx1 = max(0, xc - roi_size // 2)
-            ry1 = max(0, yc - roi_size // 2)
-            rx2 = min(cropped.shape[1], xc + roi_size // 2)
-            ry2 = min(cropped.shape[0], yc + roi_size // 2)
-            roi = cropped[ry1:ry2, rx1:rx2]
-            
-            if roi.size == 0:
-                continue
-            
-            # Step 4: Divide ROI into 8x8 grid
-            rh, rw, _ = roi.shape
-            grid_size = 8
-            ph, pw = max(1, rh // grid_size), max(1, rw // grid_size)
-            
-            cell_predictions = []
-            cell_weights = []
-            for i in range(grid_size):
-                for j in range(grid_size):
-                    y1, y2 = i * ph, (i + 1) * ph
-                    x1, x2 = j * pw, (j + 1) * pw
-                    cell = roi[y1:y2, x1:x2]
-                    if cell.size == 0:
+            h, w, _ = frame.shape
+            gs = 8
+            ph, pw = max(1, h // gs), max(1, w // gs)
+            rgbs, wts = [], []
+            for i in range(gs):
+                for j in range(gs):
+                    patch = frame[i*ph:(i+1)*ph, j*pw:(j+1)*pw]
+                    if patch.size == 0:
                         continue
-                    
-                    cell_gray = cv2.cvtColor(cell, cv2.COLOR_BGR2GRAY)
-                    cell_intensity = float(np.mean(cell_gray))
-                    
-                    # Skip dark/empty cells
-                    if cell_intensity < 10:
+                    gray_val = float(np.mean(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)))
+                    if gray_val > 240 or gray_val < 10:
                         continue
-                    
-                    # Step 5: Predict each grid cell independently
-                    rgb_mean = cv2.resize(cell, (1, 1))[0, 0][::-1].astype(float)
-                    pred_nm = float(ml_predict(obj, rgb_mean.reshape(1, -1))[0])
-                    
-                    cell_predictions.append(pred_nm)
-                    cell_weights.append(cell_intensity ** 2)
-            
-            if not cell_predictions:
+                    rgb = cv2.resize(patch, (1, 1))[0, 0][::-1].astype(float)
+                    rgbs.append(rgb)
+                    wts.append(gray_val)
+            if not rgbs:
                 continue
             
-            # Step 6: Weighted average of the PREDICTIONS (not the colors)
-            cell_weights = np.array(cell_weights)
-            cell_weights /= cell_weights.sum()
-            frame_nm = float(np.average(cell_predictions, weights=cell_weights))
-            frame_intensity = float(np.mean(cell_weights))
-            
-            wavelengths.append(frame_nm)
-            intensities.append(frame_intensity)
+            # Predict each patch separately to prevent color mixing (which causes cyan ~491nm)
+            batch_arr = np.array(rgbs, float)
+            predictions = ml_predict(obj, batch_arr)
+            wavelengths.extend(predictions.tolist())
+            intensities.extend(wts)
 
         cap.release()
     finally:
@@ -432,8 +294,8 @@ async def analyze(
         "max_nm":        stats["max_nm"],
         "ensemble_type": obj["type"],
         "ensemble_r2":   round(obj["r2"], 4),
-        "spectrum_x":    json.dumps(x_grid),
-        "spectrum_y":    json.dumps(spec),
+        "spectrum_x":    json.dumps(x_grid.tolist()),
+        "spectrum_y":    json.dumps(spec.tolist()),
     }
     pd.DataFrame([record]).to_sql("results", engine, if_exists="append", index=False)
 
@@ -441,7 +303,7 @@ async def analyze(
     return {
         "stats": stats,
         "model": {"type": obj["type"], "r2": round(obj["r2"], 4)},
-        "spectrum": {"x": x_grid, "y": spec},
+        "spectrum": {"x": x_grid.tolist(), "y": spec.tolist()},
         "frames": {
             "wavelength": wl[::stride].tolist(),
             "intensity":  (inten / inten.max() if inten.max() > 0 else inten)[::stride].tolist(),
