@@ -8,6 +8,8 @@ import pandas as pd
 import cv2
 import joblib
 from datetime import datetime
+import scipy.ndimage as ndi
+import scipy.signal as signal
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -116,7 +118,7 @@ def get_ensemble():
         + WhiteKernel(1, (1e-5, 1e3))
     )
     gpr = GaussianProcessRegressor(kernel=kernel, normalize_y=True,
-                                   n_restarts_optimizer=3, random_state=42)
+                                   n_restarts_optimizer=5, random_state=42)
     base = {
         "rf":  RandomForestRegressor(n_estimators=200, random_state=42),
         "gbr": GradientBoostingRegressor(random_state=42),
@@ -165,17 +167,59 @@ def ml_predict(obj, X):
 
 
 def build_spectrum(wl, inten, x_min=300, x_max=700, step=1.0, sigma=20.0):
-    wl = np.asarray(wl, float)
-    inten = np.asarray(inten, float)
+    wl = np.asarray(wl, dtype=float)
+    inten = np.asarray(inten, dtype=float)
     x_grid = np.arange(x_min, x_max + step, step)
+    
     if len(wl) == 0:
-        return x_grid, np.zeros_like(x_grid), float("nan")
-    w = inten / inten.max() if inten.max() > 0 else inten
-    gauss = np.exp(-0.5 * ((x_grid[None, :] - wl[:, None]) / sigma) ** 2)
-    spec = (w[:, None] * gauss).sum(axis=0)
-    if spec.max() > 0:
-        spec /= spec.max()
-    return x_grid, spec, float(x_grid[np.argmax(spec)])
+        return x_grid.tolist(), np.zeros_like(x_grid).tolist(), float("nan")
+
+    if np.allclose(wl, wl[0]):
+        peak_wl = float(wl[0])
+        x_s = np.linspace(max(300, peak_wl - 5), min(700, peak_wl + 5), 200)
+        y_s = np.exp(-0.5 * ((x_s - peak_wl) / 1.5) ** 2)
+        y_s = y_s / np.max(y_s)
+        return x_s.tolist(), y_s.tolist(), peak_wl
+
+    wl_min, wl_max = wl.min(), wl.max()
+    wl_range = max(1e-6, wl_max - wl_min)
+    bins = int(np.clip(wl_range * 2.0, 80, 400))
+
+    hist, bin_edges = np.histogram(wl, bins=bins, range=(wl_min - 0.1*wl_range, wl_max + 0.1*wl_range), weights=inten)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    if hist.max() > 0:
+        hist = hist.astype(float) / np.max(hist)
+    else:
+        hist = hist.astype(float)
+
+    gaussian_sigma = max(1.0, bins / 150.0)
+    y_s = ndi.gaussian_filter1d(hist, sigma=gaussian_sigma)
+    x_s = bin_centers
+
+    y_s = np.clip(y_s, 0.0, None)
+    if y_s.max() > 0:
+        y_s = y_s / y_s.max()
+
+    peaks, props = signal.find_peaks(y_s, height=0.2, distance=3)
+    if len(peaks) > 0:
+        peak_idx = peaks[np.argmax(props["peak_heights"])]
+        peak_wl = float(x_s[peak_idx])
+    else:
+        peak_idx = int(np.argmax(y_s))
+        peak_wl = float(x_s[peak_idx])
+
+    return x_s.tolist(), y_s.tolist(), peak_wl
+
+def detect_dynamic_roi(frame, roi_size=50):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (9, 9), 0)
+    _, _, _, maxLoc = cv2.minMaxLoc(gray)
+    xc, yc = maxLoc
+    x1, y1 = max(0, xc - roi_size//2), max(0, yc - roi_size//2)
+    x2, y2 = min(frame.shape[1], xc + roi_size//2), min(frame.shape[0], yc + roi_size//2)
+    roi = frame[y1:y2, x1:x2]
+    return roi
 
 
 # ── Endpoints ────────────────────────────────────────────────
@@ -235,70 +279,56 @@ async def analyze(
         if not cap.isOpened():
             raise HTTPException(400, "Cannot open video file")
 
+        frame_idx = 0
+        frame_batch_rgb = []
+        frame_batch_intensity = []
         wavelengths, intensities = [], []
+        
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
-            # 1. Background Cropping (Black region removal)
-            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray_full, 15, 255, cv2.THRESH_BINARY)
-            coords = cv2.findNonZero(thresh)
+            frame_idx += 1
             
-            if coords is None:
-                continue
-                
-            x, y, w_bbox, h_bbox = cv2.boundingRect(coords)
-            cropped_frame = frame[y:y+h_bbox, x:x+w_bbox]
-            gray_crop = gray_full[y:y+h_bbox, x:x+w_bbox]
-            
-            h_crop, w_crop = cropped_frame.shape[:2]
-            gs = 8
-            ph, pw = max(1, h_crop // gs), max(1, w_crop // gs)
-            
-            rgbs, wts = [], []
-            for i in range(gs):
-                for j in range(gs):
-                    y_start, y_end = i*ph, (i+1)*ph
-                    x_start, x_end = j*pw, (j+1)*pw
-                    
-                    patch = cropped_frame[y_start:y_end, x_start:x_end]
-                    p_gray = gray_crop[y_start:y_end, x_start:x_end]
-                    
+            # Use the FULL frame for 8x8 grid (NOT ROI-cropped)
+            # intensity² weighting naturally suppresses black background patches
+            h, w, _ = frame.shape
+            grid_size = 8
+            patch_h, patch_w = h // grid_size, w // grid_size
+
+            patch_rgbs = []
+            patch_weights = []
+            for i in range(grid_size):
+                for j in range(grid_size):
+                    y1, y2 = i * patch_h, (i + 1) * patch_h
+                    x1, x2 = j * patch_w, (j + 1) * patch_w
+                    patch = frame[y1:y2, x1:x2]
                     if patch.size == 0:
                         continue
-                        
-                    # Find the pixel with the highest true color saturation (avoids overexposed white/cyan camera flares which cause 494nm)
-                    patch_hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-                    _, max_sat, _, max_loc = cv2.minMaxLoc(patch_hsv[:, :, 1])
-                    
-                    if max_sat < 30: # Ignore completely washed out grey/white pixels
-                        continue
-                        
-                    # Grab that raw highly-saturated pure colored pixel
-                    purest_bgr = patch[max_loc[1], max_loc[0]]
-                    gray_intensity = float(p_gray[max_loc[1], max_loc[0]])
-                    
-                    if gray_intensity < 15: # Ignore deep black noise
-                        continue
-                        
-                    rgb = np.array(purest_bgr[::-1], dtype=float) # BGR to RGB
-                    
-                    if sum(rgb) < 20: 
-                        continue
-                        
-                    rgbs.append(rgb)
-                    wts.append(gray_intensity)
-                    
-            if not rgbs:
+                    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+                    intensity = np.mean(gray)
+                    rgb_mean = cv2.resize(patch, (1, 1))[0, 0][::-1]
+                    patch_rgbs.append(rgb_mean)
+                    patch_weights.append(intensity ** 2)
+
+            patch_weights = np.array(patch_weights)
+            if patch_weights.sum() == 0:
                 continue
-                
-            # Batched Grid Prediction (Evaluate patches independently to avoid color averaging)
-            batch_arr = np.array(rgbs, float)
-            predictions = ml_predict(obj, batch_arr)
-            # Collect and keep all grid predictions to build the multimodal spectrum
-            wavelengths.extend(predictions.tolist())
-            intensities.extend(wts)
+            patch_weights /= patch_weights.sum()
+            patch_rgbs = np.array(patch_rgbs)
+            weighted_rgb = np.average(patch_rgbs, axis=0, weights=patch_weights)
+
+            frame_batch_rgb.append(weighted_rgb)
+            frame_batch_intensity.append(np.mean(patch_weights))
+
+            # Aggregate every 26 frames (~1 sec)
+            if frame_idx % 26 == 0:
+                avg_rgb = np.mean(frame_batch_rgb, axis=0)
+                avg_intensity = np.mean(frame_batch_intensity)
+                pred_nm = float(ml_predict(obj, np.array(avg_rgb).reshape(1, -1))[0])
+                wavelengths.append(pred_nm)
+                intensities.append(avg_intensity)
+                frame_batch_rgb, frame_batch_intensity = [], []
 
         cap.release()
     finally:
