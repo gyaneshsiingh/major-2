@@ -27,8 +27,8 @@ export default function CompareSection({ uploads }) {
         <div>
           <div className="card">
             <div className="card-title">Select Runs to Compare</div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 15, marginBottom: 20 }}>
-              <div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 15, marginBottom: 20 }}>
+              <div style={{ flex: '1 1 120px' }}>
                 <label style={{ fontSize: 12, color: '#8a9bb5', display: 'block', marginBottom: 5 }}>Reference Run</label>
                 <select className="styled-input" value={runA} onChange={e => setRunA(e.target.value)}>
                   <option value="">Select a run...</option>
@@ -37,7 +37,7 @@ export default function CompareSection({ uploads }) {
                   ))}
                 </select>
               </div>
-              <div>
+              <div style={{ flex: '1 1 120px' }}>
                 <label style={{ fontSize: 12, color: '#8a9bb5', display: 'block', marginBottom: 5 }}>Comparison Run</label>
                 <select className="styled-input" value={runB} onChange={e => setRunB(e.target.value)}>
                   <option value="">Select a run...</option>
@@ -59,36 +59,38 @@ export default function CompareSection({ uploads }) {
 
           <div className="card">
             <div className="card-title">Comparison Details</div>
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Metric</th>
-                  <th>{dataA?.sampleName || 'Run A'}</th>
-                  <th>{dataB?.sampleName || 'Run B'}</th>
-                  <th>Diff</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td>Peak λ</td>
-                  <td>{dataA?.peakNm || '—'} nm</td>
-                  <td>{dataB?.peakNm || '—'} nm</td>
-                  <td style={{ fontWeight: 600 }}>{shift} nm</td>
-                </tr>
-                <tr>
-                  <td>Avg λ</td>
-                  <td>{dataA?.avgNm || '—'} nm</td>
-                  <td>{dataB?.avgNm || '—'} nm</td>
-                  <td>{dataA && dataB ? (dataA.avgNm - dataB.avgNm).toFixed(2) : '—'} nm</td>
-                </tr>
-                <tr>
-                  <td>Voltage</td>
-                  <td>{dataA?.voltage || '—'}V</td>
-                  <td>{dataB?.voltage || '—'}V</td>
-                  <td>{dataA && dataB ? (dataA.voltage - dataB.voltage).toFixed(1) : '—'}V</td>
-                </tr>
-              </tbody>
-            </table>
+            <div className="data-table-wrapper">
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Metric</th>
+                    <th>{dataA?.sampleName || 'Run A'}</th>
+                    <th>{dataB?.sampleName || 'Run B'}</th>
+                    <th>Diff</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Peak λ</td>
+                    <td>{dataA?.peakNm || '—'} nm</td>
+                    <td>{dataB?.peakNm || '—'} nm</td>
+                    <td style={{ fontWeight: 600 }}>{shift} nm</td>
+                  </tr>
+                  <tr>
+                    <td>Avg λ</td>
+                    <td>{dataA?.avgNm || '—'} nm</td>
+                    <td>{dataB?.avgNm || '—'} nm</td>
+                    <td>{dataA && dataB ? (dataA.avgNm - dataB.avgNm).toFixed(2) : '—'} nm</td>
+                  </tr>
+                  <tr>
+                    <td>Voltage</td>
+                    <td>{dataA?.voltage || '—'}V</td>
+                    <td>{dataB?.voltage || '—'}V</td>
+                    <td>{dataA && dataB ? (dataA.voltage - dataB.voltage).toFixed(1) : '—'}V</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
           </div>
         </div>
 

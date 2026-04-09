@@ -102,11 +102,11 @@ export default function ResultsSection({ uploads }) {
 
       <div className="card">
         <div className="card-title">All Analytical Records</div>
-        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 20, gap: 20, flexWrap: 'wrap' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 20, gap: 15, flexWrap: 'wrap' }}>
           <input
             className="styled-input"
             placeholder="🔍 Search samples..."
-            style={{ flex: '1 1 300px' }}
+            style={{ flex: '1 1 120px', minWidth: '120px' }}
             value={search}
             onChange={e => setSearch(e.target.value)}
           />

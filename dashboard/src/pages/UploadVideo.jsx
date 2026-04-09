@@ -169,7 +169,7 @@ export default function UploadVideo({ uploads, addUpload }) {
               <div className="card-title">Emission Spectrum — {sampleName}</div>
 
               {/* Stats row */}
-              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12, marginBottom: 20 }}>
+              <div className="stats-grid" style={{ marginBottom: 20 }}>
                 {[
                   ['Avg λ', `${result.stats.avg_nm} nm`],
                   ['Peak λ', `${result.stats.peak_nm} nm`],

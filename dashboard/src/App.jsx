@@ -74,6 +74,7 @@ export default function App() {
 
   return (
     <div className="app-shell">
+      {sidebarOpen && <div className="sidebar-overlay" onClick={() => setSidebarOpen(false)}></div>}
       <Sidebar 
         currentPage={page} 
         setPage={setPage} 
