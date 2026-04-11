@@ -14,12 +14,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, StackingRegressor, ExtraTreesRegressor
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import RBF, ConstantKernel, WhiteKernel
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.linear_model import Ridge
 from sklearn.metrics import r2_score
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 
 try:
     from xgboost import XGBRegressor
@@ -106,6 +108,9 @@ def get_ensemble():
 
     print(f"[INFO] Training on {csv_path}")
     df = pd.read_csv(csv_path)
+    # Filter to visible range only (400-700nm) for better accuracy
+    df = df[(df["nm"] >= 400) & (df["nm"] <= 700)]
+    print(f"[INFO] Filtered to visible range: {len(df)} rows (400-700nm)")
     X = df.drop(columns=["nm"])
     y = df["nm"].values
     X_tr, X_val, y_tr, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
@@ -116,7 +121,7 @@ def get_ensemble():
         + WhiteKernel(1, (1e-5, 1e3))
     )
     gpr = GaussianProcessRegressor(kernel=kernel, normalize_y=True,
-                                   n_restarts_optimizer=3, random_state=42)
+                                   n_restarts_optimizer=5, random_state=42)
     base = {
         "rf":  RandomForestRegressor(n_estimators=200, random_state=42),
         "gbr": GradientBoostingRegressor(random_state=42),
@@ -139,25 +144,20 @@ def get_ensemble():
         return sum(w * m.predict(Xi) for w, m in zip(weights, base.values()))
 
     w_r2 = r2_score(y_val, w_pred(X_val))
-    stack = StackingRegressor([(n, m) for n, m in base.items()],
-                               final_estimator=Ridge(), n_jobs=-1)
-    stack.fit(X_tr, y_tr)
-    s_r2 = r2_score(y_val, stack.predict(X_val))
+    print(f"  ensemble (all {len(base)} models) R²={w_r2:.4f}")
+    for name, wt in zip(base.keys(), weights):
+        print(f"    {name}: weight={wt:.4f}")
 
-    if s_r2 >= w_r2:
-        obj = {"type": "stacking", "model": stack, "r2": float(s_r2)}
-    else:
-        obj = {"type": "weighted", "models": base, "weights": weights, "r2": float(w_r2)}
+    obj = {"type": "ensemble_all", "models": base, "weights": weights, "r2": float(w_r2)}
 
     joblib.dump(obj, MODEL_PATH)
-    print(f"[INFO] Saved {obj['type']} R²={obj['r2']:.4f}")
+    print(f"[INFO] ✅ Saved ensemble_all R²={obj['r2']:.4f}")
     _ensemble_cache = obj
     return obj
 
 
 def ml_predict(obj, X):
-    if obj["type"] == "stacking":
-        return obj["model"].predict(X)
+    """Predict using ALL models weighted by R²."""
     preds = np.zeros(len(X))
     for w, m in zip(obj["weights"], obj["models"].values()):
         preds += w * m.predict(X)
@@ -235,34 +235,54 @@ async def analyze(
         if not cap.isOpened():
             raise HTTPException(400, "Cannot open video file")
 
+        frame_idx = 0
+        frame_batch_rgb = []
+        frame_batch_intensity = []
         wavelengths, intensities = [], []
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
+            frame_idx += 1
+
             h, w, _ = frame.shape
-            gs = 8
-            ph, pw = max(1, h // gs), max(1, w // gs)
-            rgbs, wts = [], []
-            for i in range(gs):
-                for j in range(gs):
-                    patch = frame[i*ph:(i+1)*ph, j*pw:(j+1)*pw]
+            grid_size = 8
+            patch_h, patch_w = h // grid_size, w // grid_size
+
+            patch_rgbs = []
+            patch_weights = []
+            for i in range(grid_size):
+                for j in range(grid_size):
+                    y1, y2 = i * patch_h, (i + 1) * patch_h
+                    x1, x2 = j * patch_w, (j + 1) * patch_w
+                    patch = frame[y1:y2, x1:x2]
                     if patch.size == 0:
                         continue
-                    gray_val = float(np.mean(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)))
-                    if gray_val > 240 or gray_val < 10:
-                        continue
-                    rgb = cv2.resize(patch, (1, 1))[0, 0][::-1].astype(float)
-                    rgbs.append(rgb)
-                    wts.append(gray_val)
-            if not rgbs:
+                    gray = cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY)
+                    intensity = np.mean(gray)
+                    rgb_mean = cv2.resize(patch, (1, 1))[0, 0][::-1]
+                    patch_rgbs.append(rgb_mean)
+                    patch_weights.append(intensity ** 2)
+
+            patch_weights = np.array(patch_weights)
+            if patch_weights.sum() == 0:
                 continue
-            
-            # Predict each patch separately to prevent color mixing (which causes cyan ~491nm)
-            batch_arr = np.array(rgbs, float)
-            predictions = ml_predict(obj, batch_arr)
-            wavelengths.extend(predictions.tolist())
-            intensities.extend(wts)
+            patch_weights /= patch_weights.sum()
+            patch_rgbs = np.array(patch_rgbs)
+            weighted_rgb = np.average(patch_rgbs, axis=0, weights=patch_weights)
+
+            frame_batch_rgb.append(weighted_rgb)
+            frame_batch_intensity.append(np.mean(patch_weights))
+
+            # Aggregate every 26 frames (~1 sec)
+            if frame_idx % 26 == 0:
+                avg_rgb = np.mean(frame_batch_rgb, axis=0)
+                avg_intensity = np.mean(frame_batch_intensity)
+                batch_df = pd.DataFrame([avg_rgb], columns=["Red", "Green", "Blue"])
+                pred_nm = float(ml_predict(obj, batch_df)[0])
+                wavelengths.append(pred_nm)
+                intensities.append(avg_intensity)
+                frame_batch_rgb, frame_batch_intensity = [], []
 
         cap.release()
     finally:
